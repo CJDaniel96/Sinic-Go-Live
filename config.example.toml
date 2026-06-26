@@ -1,0 +1,91 @@
+[input]
+# 機台輸出根目錄。通常底下會產生時間戳資料夾。
+input_dir = "/path/to/machine/output"
+
+# 我們處理後要回傳 CSV 給機台的目錄。
+return_dir = "/path/to/machine/return"
+
+# false: 直接回傳到 return_dir/CSV檔名
+# true: 回傳到 return_dir/時間戳資料夾/CSV檔名
+preserve_folder = false
+
+# 回傳檔已存在時是否覆寫。
+overwrite = true
+
+[watch]
+# 程式會一直跑，直到你按 Ctrl+C 停止。
+poll_interval_seconds = 1.0
+
+# CSV/JPG 檔案大小與修改時間穩定多久後，才開始處理。
+settle_seconds = 2.0
+
+# 資料夾一直缺 CSV、缺 JPG 或檔案不穩定時，多久記錄一次 timeout 事件。
+# 設成 0 可關閉。
+ready_timeout_seconds = 300.0
+
+# true: 只有 CSV、沒有 JPG/JPEG 也會處理。
+# false: 會等 JPG/JPEG 出現。
+allow_no_images = false
+
+[result]
+# fixed: 全部列都寫 fixed_code
+# random_row: 每一列各自依權重隨機寫 22 或 23
+# random_file: 每個 CSV 隨機決定一個值，整份 CSV 同值
+mode = "random_row"
+fixed_code = "23"
+
+[result.weights]
+"22" = 50
+"23" = 50
+
+[scenario]
+# 每個時間戳資料夾 ready 後，會依 weight 隨機挑一個情境執行。
+
+[[scenario.cases]]
+name = "normal_return"
+weight = 70
+
+[[scenario.cases]]
+name = "delayed_return"
+weight = 10
+min_delay_seconds = 5
+max_delay_seconds = 120
+
+[[scenario.cases]]
+name = "no_return"
+weight = 5
+
+[[scenario.cases]]
+name = "empty_csv"
+weight = 3
+
+[[scenario.cases]]
+name = "missing_is_pass_column"
+weight = 3
+
+[[scenario.cases]]
+name = "partial_rows"
+weight = 5
+partial_row_ratio = 0.5
+
+[[scenario.cases]]
+name = "malformed_csv"
+weight = 4
+
+[report]
+# 若 create_run_subdir=true，每次執行會產生 reports/run_YYYYMMDD_HHMMSS/
+output_dir = "./reports"
+create_run_subdir = true
+write_jsonl = true
+write_summary_csv = true
+write_markdown_report = true
+
+[run]
+# false: 持續監看直到 Ctrl+C。
+# true: 處理目前 ready 的資料後結束，適合本機驗證。
+once = false
+
+# 固定 seed 可重現隨機情境；不需要重現時可刪掉這行。
+random_seed = 20260626
+
+log_level = "INFO"
