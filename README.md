@@ -4,6 +4,10 @@
 
 目前不執行 AI 推論，只測試檔案取得、CSV 回寫、回傳位置、耗時與異常情境。
 
+程式只會處理資料夾名稱符合 `YYYYMMDDHHMMSS`，且日期為執行當天的時間戳資料夾；其他日期或其他名稱的資料夾會略過。常駐執行跨過午夜後，會自動改為處理新日期的資料夾。
+
+監控方式可在 `[watch] mode` 選擇 `poll`（定期掃描）或 `event`（檔案系統事件）。`event` 模式啟動時會先掃描一次，收到新增、搬移、修改或刪除事件時立即檢查，並以 `event_rescan_seconds` 低頻補掃，避免漏接事件。
+
 ## 環境
 
 - Python: `3.12`
@@ -150,6 +154,16 @@ weight = 1
 [watch]
 allow_no_images = true
 ```
+
+使用檔案系統事件監聽：
+
+```toml
+[watch]
+mode = "event"
+event_rescan_seconds = 60.0
+```
+
+也可以使用命令列參數 `--watch-mode event` 切換。若輸入路徑位於不可靠的網路磁碟，可改用 `poll` 模式。
 
 ## 打包成 Windows exe
 

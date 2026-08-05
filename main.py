@@ -6,19 +6,25 @@ import json
 import logging
 import os
 import random
+import re
 import statistics
+import sys
+import threading
 import time
 import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
 
 CSV_SUFFIX = ".csv"
 IMAGE_SUFFIXES = {".jpg", ".jpeg"}
+TIMESTAMP_FOLDER_PATTERN = re.compile(r"\d{14}")
+TIMESTAMP_FOLDER_FORMAT = "%Y%m%d%H%M%S"
 DEFAULT_RESULT_CODE = "23"
+VALID_WATCH_MODES = {"poll", "event"}
 VALID_RESULT_MODES = {"fixed", "random_row", "random_file"}
 VALID_SCENARIOS = {
     "normal_return",
@@ -79,7 +85,9 @@ class FolderState:
 
 @dataclass(frozen=True)
 class WatchConfig:
+    mode: str = "poll"
     poll_interval_seconds: float = 1.0
+    event_rescan_seconds: float = 60.0
     settle_seconds: float = 2.0
     ready_timeout_seconds: float = 300.0
     allow_no_images: bool = False
@@ -171,6 +179,10 @@ class PendingReturn:
     due_at: str
     due_mono: float
     finalized: bool = False
+
+
+class EventWatcherError(RuntimeError):
+    pass
 
 
 class Reporter:
@@ -296,7 +308,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, help="Override config input.input_dir.")
     parser.add_argument("--return-dir", type=Path, help="Override config input.return_dir.")
     parser.add_argument("--result-code", help="Override result mode to fixed and use this code.")
+    parser.add_argument(
+        "--watch-mode",
+        choices=tuple(sorted(VALID_WATCH_MODES)),
+        help="Override watch.mode (poll or event).",
+    )
     parser.add_argument("--poll-interval", type=float, help="Override watch.poll_interval_seconds.")
+    parser.add_argument(
+        "--event-rescan-seconds",
+        type=float,
+        help="Override watch.event_rescan_seconds.",
+    )
     parser.add_argument("--settle-seconds", type=float, help="Override watch.settle_seconds.")
     parser.add_argument("--ready-timeout", type=float, help="Override watch.ready_timeout_seconds.")
     parser.add_argument("--once", action="store_true", default=None, help="Process ready folders and exit.")
@@ -351,6 +373,19 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     preserve_folder = bool_value(args.preserve_folder, input_section.get("preserve_folder", False))
     overwrite = bool_value(args.overwrite, input_section.get("overwrite", False))
     allow_no_images = bool_value(args.allow_no_images, watch_section.get("allow_no_images", False))
+    watch_mode = str(args.watch_mode or watch_section.get("mode", "poll")).lower()
+    if watch_mode not in VALID_WATCH_MODES:
+        raise ValueError(
+            f"Invalid watch.mode: {watch_mode}. Valid values: {sorted(VALID_WATCH_MODES)}"
+        )
+
+    event_rescan_seconds = float(
+        args.event_rescan_seconds
+        if args.event_rescan_seconds is not None
+        else watch_section.get("event_rescan_seconds", 60.0)
+    )
+    if event_rescan_seconds <= 0:
+        raise ValueError("watch.event_rescan_seconds must be greater than 0.")
 
     result_mode = str(result_section.get("mode", "fixed"))
     fixed_code = str(result_section.get("fixed_code", DEFAULT_RESULT_CODE))
@@ -389,7 +424,9 @@ def load_config(args: argparse.Namespace) -> AppConfig:
             overwrite=overwrite,
         ),
         watch=WatchConfig(
+            mode=watch_mode,
             poll_interval_seconds=float(args.poll_interval if args.poll_interval is not None else watch_section.get("poll_interval_seconds", 1.0)),
+            event_rescan_seconds=event_rescan_seconds,
             settle_seconds=float(args.settle_seconds if args.settle_seconds is not None else watch_section.get("settle_seconds", 2.0)),
             ready_timeout_seconds=float(args.ready_timeout if args.ready_timeout is not None else watch_section.get("ready_timeout_seconds", 300.0)),
             allow_no_images=allow_no_images,
@@ -475,13 +512,30 @@ def bool_value(cli_value: bool | None, config_value: Any) -> bool:
     return bool(config_value)
 
 
-def list_candidate_folders(input_dir: Path) -> tuple[Path, ...]:
+def is_timestamp_folder_for_date(folder: Path, target_date: date) -> bool:
+    if TIMESTAMP_FOLDER_PATTERN.fullmatch(folder.name) is None:
+        return False
+
+    try:
+        folder_date = datetime.strptime(folder.name, TIMESTAMP_FOLDER_FORMAT).date()
+    except ValueError:
+        return False
+
+    return folder_date == target_date
+
+
+def list_candidate_folders(
+    input_dir: Path, target_date: date | None = None
+) -> tuple[Path, ...]:
+    if target_date is None:
+        target_date = datetime.now().date()
+
     folders: list[Path] = []
-    if find_csv_files(input_dir):
+    if is_timestamp_folder_for_date(input_dir, target_date) and find_csv_files(input_dir):
         folders.append(input_dir)
 
     for child in input_dir.iterdir():
-        if child.is_dir():
+        if child.is_dir() and is_timestamp_folder_for_date(child, target_date):
             folders.append(child)
 
     return tuple(sorted(folders, key=lambda item: item.name))
@@ -955,6 +1009,48 @@ def folder_key(folder: Path) -> str:
     return str(folder.resolve())
 
 
+def start_event_observer(input_dir: Path, change_event: threading.Event) -> Any:
+    try:
+        from watchdog.events import FileSystemEventHandler
+        if sys.platform == "darwin":
+            from watchdog.observers.kqueue import KqueueObserver as Observer
+        else:
+            from watchdog.observers import Observer
+    except ImportError as exc:
+        raise EventWatcherError(
+            "Event watch mode requires the 'watchdog' package. Run 'uv sync' first."
+        ) from exc
+
+    class ChangeHandler(FileSystemEventHandler):
+        def on_any_event(self, event: Any) -> None:
+            change_event.set()
+
+    try:
+        observer = Observer()
+        observer.schedule(ChangeHandler(), str(input_dir), recursive=True)
+        observer.start()
+    except Exception as exc:
+        raise EventWatcherError(
+            f"Unable to start event watcher for {input_dir}: {exc}"
+        ) from exc
+
+    return observer
+
+
+def event_wait_timeout(
+    now_mono: float,
+    config: AppConfig,
+    readiness_deadlines: Sequence[float],
+    pending_returns: Sequence[PendingReturn],
+) -> float:
+    deadlines = [now_mono + config.watch.event_rescan_seconds]
+    deadlines.extend(readiness_deadlines)
+    deadlines.extend(
+        pending.due_mono for pending in pending_returns if not pending.finalized
+    )
+    return max(0.0, min(deadlines) - time.monotonic())
+
+
 def run(config: AppConfig) -> int:
     if not config.input.input_dir.exists() or not config.input.input_dir.is_dir():
         logging.error("Input directory does not exist or is not a directory: %s", config.input.input_dir)
@@ -968,11 +1064,14 @@ def run(config: AppConfig) -> int:
     processed: set[str] = set()
     pending_returns: list[PendingReturn] = []
     exit_code = 0
+    change_event = threading.Event()
+    observer: Any | None = None
 
     logging.info("Input directory: %s", config.input.input_dir)
     logging.info("Return directory: %s", config.input.return_dir)
     logging.info("Report directory: %s", reporter.output_dir)
     logging.info("Mode: %s", "once" if config.run.once else "watch")
+    logging.info("Watch mode: %s", config.watch.mode)
     logging.info("Result mode: %s", config.result.mode)
     reporter.event(
         "run_started",
@@ -980,13 +1079,29 @@ def run(config: AppConfig) -> int:
         return_dir=str(config.input.return_dir),
         report_dir=str(reporter.output_dir),
         mode="once" if config.run.once else "watch",
+        watch_mode=config.watch.mode,
         result_mode=config.result.mode,
         scenarios=[case.name for case in config.scenario.cases],
     )
 
     try:
+        if config.watch.mode == "event" and not config.run.once:
+            observer = start_event_observer(config.input.input_dir, change_event)
+            logging.info(
+                "Event watcher started; fallback rescan every %.1f second(s)",
+                config.watch.event_rescan_seconds,
+            )
+            reporter.event(
+                "event_watcher_started",
+                fallback_rescan_seconds=config.watch.event_rescan_seconds,
+            )
+
         while True:
+            if observer is not None:
+                change_event.clear()
+
             now = time.monotonic()
+            readiness_deadlines: list[float] = []
             finalize_due_pending_returns(pending_returns, now, config, reporter, rng)
 
             candidate_folders = list_candidate_folders(config.input.input_dir)
@@ -1057,6 +1172,18 @@ def run(config: AppConfig) -> int:
                     continue
 
                 handle_ready_timeout(job, state, config, reporter)
+                has_required_files = bool(job.csv_files) and (
+                    config.watch.allow_no_images or bool(job.image_files)
+                )
+                if has_required_files:
+                    readiness_deadlines.append(
+                        state.stable_since + config.watch.settle_seconds
+                    )
+                if config.watch.ready_timeout_seconds > 0:
+                    last_timeout = state.last_timeout_warning or state.first_seen
+                    readiness_deadlines.append(
+                        last_timeout + config.watch.ready_timeout_seconds
+                    )
 
             if config.run.once:
                 remaining = [
@@ -1067,12 +1194,30 @@ def run(config: AppConfig) -> int:
                 if not remaining and not pending_returns:
                     break
 
-            time.sleep(config.watch.poll_interval_seconds)
+            if observer is None:
+                time.sleep(config.watch.poll_interval_seconds)
+            else:
+                wait_seconds = event_wait_timeout(
+                    now,
+                    config,
+                    readiness_deadlines,
+                    pending_returns,
+                )
+                change_event.wait(wait_seconds)
     except KeyboardInterrupt:
         logging.info("Stopped by user")
         reporter.event("run_stopped_by_user")
         exit_code = 130
+    except EventWatcherError as exc:
+        logging.error("%s", exc)
+        reporter.event("event_watcher_failed", error=str(exc))
+        exit_code = 2
     finally:
+        if observer is not None:
+            observer.stop()
+            observer.join()
+            logging.info("Event watcher stopped")
+
         for pending in pending_returns:
             if pending.finalized:
                 continue

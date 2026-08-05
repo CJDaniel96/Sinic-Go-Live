@@ -13,8 +13,15 @@ preserve_folder = false
 overwrite = true
 
 [watch]
+# poll: 每隔 poll_interval_seconds 掃描一次。
+# event: 用檔案系統事件監聽，並定期補掃以避免漏接事件。
+mode = "event"
+
 # 程式會一直跑，直到你按 Ctrl+C 停止。
 poll_interval_seconds = 1.0
+
+# event 模式下的低頻補掃間隔；同時用來涵蓋程式啟動前及網路磁碟漏掉的事件。
+event_rescan_seconds = 60.0
 
 # CSV/JPG 檔案大小與修改時間穩定多久後，才開始處理。
 settle_seconds = 2.0
